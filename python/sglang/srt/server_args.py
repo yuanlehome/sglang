@@ -3186,11 +3186,13 @@ class ServerArgs:
         # TODO(yuwei): Fix piecewise cuda graph support for bypassed topk MoE backends.
         # Exception: GptOssForCausalLM wraps the entire MoE block in its own
         # custom op (moe_impl), so bypassed topk is handled inside the op body.
+        # Exception: DeepEP handles topk via its own dispatcher, bypassed topk is not needed.
         if (
             not self.enforce_piecewise_cuda_graph
             and self.moe_runner_backend in ("flashinfer_trtllm", "flashinfer_mxfp4")
             and self.get_model_config().hf_config.architectures[0]
             != "GptOssForCausalLM"
+            and self.moe_a2a_backend != "deepep"
         ):
             self.disable_piecewise_cuda_graph = True
             logger.info(

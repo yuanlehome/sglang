@@ -51,6 +51,10 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+        DeepEPLLDispatchOutput,
+    )
 
 if is_flashinfer_available():
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
@@ -653,11 +657,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         # Move kernel call outside context manager to avoid graph breaks
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
-        if use_routed_topk:
-            assert (
-                runner_config.top_k is not None
-            ), "runner_config.top_k is required for flashinfer_trtllm_routed."
+        if use_routed_topk or TopKOutputChecker.format_is_standard(topk_output):
+            # Standard topk format: topk_ids/topk_weights already computed
+            # (e.g. from HashTopK or explicit use_routed_topk=True).
             assert TopKOutputChecker.format_is_standard(topk_output)
+            top_k = (
+                runner_config.top_k
+                if runner_config.top_k is not None
+                else topk_output.topk_ids.shape[-1]
+            )
             packed_topk_ids = _pack_topk_for_flashinfer_routed(
                 topk_ids=topk_output.topk_ids,
                 topk_weights=topk_output.topk_weights,
@@ -673,7 +681,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 num_experts=quant_info.global_num_experts,
-                top_k=runner_config.top_k,
+                top_k=top_k,
                 n_group=None,
                 topk_group=None,
                 intermediate_size=quant_info.intermediate_size,
@@ -1149,6 +1157,129 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             )
 
     return StandardCombineInput(hidden_states=final_hidden_states)
+
+
+@register_fused_func("deepep", "flashinfer_trtllm")
+def fused_experts_deepep_to_flashinfer_trtllm(
+    dispatch_output: "DeepEPLLDispatchOutput",
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> "DeepEPLLCombineInput":
+    """Fused func for DeepEP low-latency dispatch + FlashInfer TRT-LLM MoE (FP8/MxFP8)."""
+    if isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
+        return _fused_experts_deepep_to_flashinfer_trtllm_fp8(
+            dispatch_output, quant_info, runner_config
+        )
+    raise TypeError(
+        f"Unexpected quant_info type for deepep+flashinfer_trtllm: {type(quant_info)}"
+    )
+
+
+def _fused_experts_deepep_to_flashinfer_trtllm_fp8(
+    dispatch_output,
+    quant_info: FlashInferTrtllmFp8MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+):
+    from flashinfer import mxfp8_quantize
+    from flashinfer.fused_moe import Fp8QuantizationType
+
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+    )
+
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    masked_m = dispatch_output.masked_m
+    expected_m = dispatch_output.expected_m
+
+    # DeepEP low-latency returns 3D [num_experts, max_tokens_per_expert, hidden]
+    # Save original shape for reshaping output back
+    orig_3d_shape = None
+    if hidden_states.ndim == 3:
+        orig_3d_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        if hidden_states_scale is not None and hidden_states_scale.ndim == 3:
+            hidden_states_scale = hidden_states_scale.reshape(
+                -1, hidden_states_scale.shape[-1]
+            )
+
+    num_local_experts = quant_info.local_num_experts
+    local_expert_offset = quant_info.local_expert_offset
+    num_tokens = hidden_states.shape[0]
+
+    # Dequantize FP8 dispatch output to BF16 if needed, then apply mxfp8_quantize
+    if hidden_states.dtype == torch.float8_e4m3fn:
+        # DeepEP per-token FP8: dequantize to BF16
+        hidden_bf16 = hidden_states.to(torch.bfloat16)
+        if hidden_states_scale is not None:
+            # Scale may be per-block [N, hidden//block_size], expand to match hidden dim
+            if (
+                hidden_states_scale.shape[-1] != hidden_bf16.shape[-1]
+                and hidden_states_scale.shape[-1] > 1
+            ):
+                block_size = hidden_bf16.shape[-1] // hidden_states_scale.shape[-1]
+                hidden_states_scale = hidden_states_scale.repeat_interleave(
+                    block_size, dim=-1
+                )
+            hidden_bf16 = hidden_bf16 * hidden_states_scale.to(torch.bfloat16)
+    else:
+        hidden_bf16 = hidden_states
+
+    # Quantize to MxFP8 format
+    a_q, a_sf = mxfp8_quantize(hidden_bf16, False)
+    # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
+    # [num_tokens, hidden_size // 32]
+    a_sf_t = a_sf.view(torch.uint8).reshape(num_tokens, -1)
+
+    # Construct packed topk_ids: each token at position pos belongs to
+    # expert (pos // tokens_per_expert), mapped to global expert id.
+    # Format: (expert_id << 16) | (weight_bf16.view(int16))
+    # Weight = 1.0 because combine handles routing weights.
+    tokens_per_expert = orig_3d_shape[1] if orig_3d_shape is not None else expected_m
+    expert_indices = (
+        torch.arange(num_tokens, device=hidden_states.device) // tokens_per_expert
+    )
+    global_expert_ids = (expert_indices + local_expert_offset).to(torch.int32)
+    weight_one = torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16).item()
+    packed_topk_ids = (global_expert_ids << 16) | (weight_one & 0xFFFF)
+    packed_topk_ids = packed_topk_ids.unsqueeze(1)  # [num_tokens, 1]
+
+    activation_type = quant_info.activation_type
+    fp8_quantization_type = int(Fp8QuantizationType.MxFp8)
+
+    output = trtllm_fp8_block_scale_routed_moe_wrapper(
+        topk_ids=packed_topk_ids,
+        routing_bias=None,
+        hidden_states=a_q,
+        hidden_states_scale=a_sf_t,
+        gemm1_weights=quant_info.w13_weight,
+        gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+        gemm2_weights=quant_info.w2_weight,
+        gemm2_weights_scale=quant_info.w2_weight_scale_inv,
+        num_experts=quant_info.global_num_experts,
+        top_k=1,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=quant_info.intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=num_local_experts,
+        routed_scaling_factor=1.0,
+        routing_method_type=0,
+        use_shuffled_weight=True,  # mxfp8 uses shuffled weights
+        tune_max_num_tokens=next_power_of_2(num_tokens),
+        fp8_quantization_type=fp8_quantization_type,
+        activation_type=activation_type,
+    )
+
+    # Reshape output back to 3D for DeepEP low_latency_combine
+    if orig_3d_shape is not None:
+        output = output.view(orig_3d_shape[0], orig_3d_shape[1], -1)
+
+    return DeepEPLLCombineInput(
+        hidden_states=output,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
+    )
 
 
 @register_fused_func("none", "flashinfer_trtllm")
