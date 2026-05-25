@@ -87,6 +87,10 @@ def compute_overlap_args(dispatch_output, alt_stream):
 
     hidden_states = dispatch_output.hidden_states
 
+    # Normal dispatch outputs 2D tensor; overlap only applies to low_latency (3D)
+    if hidden_states.ndim != 3:
+        return None, None, {}
+
     num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
 
     total_num_sms = torch.cuda.get_device_properties(

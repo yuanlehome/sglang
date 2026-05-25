@@ -1042,14 +1042,15 @@ class DeepseekV2MoE(nn.Module):
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
-                dispatcher.set_overlap_args(
-                    combine_overlap_args=combine_overlap_args,
-                    meta_overlap_args=meta_overlap_args,
-                )
-                self.experts.set_overlap_args(
-                    down_gemm_overlap_args=down_gemm_overlap_args,
-                    meta_overlap_args=meta_overlap_args,
-                )
+                if combine_overlap_args is not None:
+                    dispatcher.set_overlap_args(
+                        combine_overlap_args=combine_overlap_args,
+                        meta_overlap_args=meta_overlap_args,
+                    )
+                    self.experts.set_overlap_args(
+                        down_gemm_overlap_args=down_gemm_overlap_args,
+                        meta_overlap_args=meta_overlap_args,
+                    )
                 post_dispatch_hook_handle.remove()
 
             def _post_combine_hook(
@@ -1082,14 +1083,15 @@ class DeepseekV2MoE(nn.Module):
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
-                dispatcher.set_overlap_args(
-                    combine_overlap_args=combine_overlap_args,
-                    meta_overlap_args=meta_overlap_args,
-                )
-                self.experts.set_overlap_args(
-                    down_gemm_overlap_args=down_gemm_overlap_args,
-                    meta_overlap_args=meta_overlap_args,
-                )
+                if combine_overlap_args is not None:
+                    dispatcher.set_overlap_args(
+                        combine_overlap_args=combine_overlap_args,
+                        meta_overlap_args=meta_overlap_args,
+                    )
+                    self.experts.set_overlap_args(
+                        down_gemm_overlap_args=down_gemm_overlap_args,
+                        meta_overlap_args=meta_overlap_args,
+                    )
 
                 post_dispatch_hook_handle.remove()
 
@@ -1099,15 +1101,19 @@ class DeepseekV2MoE(nn.Module):
 
                 nonlocal shared_output
 
-                if (
-                    e := dispatcher.meta_overlap_args.get("record_event_after_down")
-                ) is not None:
-                    e.record()
+                if dispatcher.meta_overlap_args:
+                    if (
+                        e := dispatcher.meta_overlap_args.get("record_event_after_down")
+                    ) is not None:
+                        e.record()
 
                 # TODO reduce sm for non-deepgemm
-                with deep_gemm_wrapper.configure_deep_gemm_num_sms(
-                    dispatcher.meta_overlap_args["compute_num_sms"]
-                ):
+                num_sms = (
+                    dispatcher.meta_overlap_args.get("compute_num_sms")
+                    if dispatcher.meta_overlap_args
+                    else None
+                )
+                with deep_gemm_wrapper.configure_deep_gemm_num_sms(num_sms):
                     shared_output = self._forward_shared_experts(hidden_states)
 
                 pre_combine_hook_handle.remove()

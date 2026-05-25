@@ -766,21 +766,24 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             overlap_args.stream.wait_event(overlap_args.wait_event)
             ctx = torch.cuda.stream(overlap_args.stream)
 
-            if is_blackwell():
-                overlap_args_dict = dict(
-                    overlap=overlap_args.overlap,
-                    src_signals=overlap_args.signal,
-                    src_signal_expect_value=overlap_args.threshold,
-                )
+            if overlap_args.overlap:
+                if is_blackwell():
+                    overlap_args_dict = dict(
+                        overlap=overlap_args.overlap,
+                        src_signals=overlap_args.signal,
+                        src_signal_expect_value=overlap_args.threshold,
+                    )
+                else:
+                    overlap_args_dict = dict(
+                        overlap=overlap_args.overlap,
+                        packed_recv_count=self.packed_recv_count,
+                        comp_signal=overlap_args.signal,
+                        block_m=meta_overlap_args["block_m"],
+                        threshold=meta_overlap_args["threshold"],
+                        num_sms=overlap_args.num_sms,
+                    )
             else:
-                overlap_args_dict = dict(
-                    overlap=overlap_args.overlap,
-                    packed_recv_count=self.packed_recv_count,
-                    comp_signal=overlap_args.signal,
-                    block_m=meta_overlap_args["block_m"],
-                    threshold=meta_overlap_args["threshold"],
-                    num_sms=overlap_args.num_sms,
-                )
+                overlap_args_dict = {}
         else:
             overlap_args_dict = {}
 
