@@ -361,6 +361,7 @@ class C4IndexerBackendMixin:
         assert len(c4_indexer_kv_cache.shape) == 2
         block_kv = 64
         num_heads_kv = 1
+        # FP8 mode: 132 bytes/token (128 fp8 + 4 scale)
         head_dim_with_sf = 132
 
         c4_indexer_kv_cache = c4_indexer_kv_cache.view(
@@ -368,6 +369,7 @@ class C4IndexerBackendMixin:
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+
         if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.srt.layers.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
